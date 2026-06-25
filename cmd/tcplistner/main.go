@@ -34,20 +34,12 @@ func getLinesChannel(f io.ReadCloser) <-chan string {
 		defer close(out)
 
 		str := ""
-loop:
 	for {
 		data := make([]byte, 8)
 		n, err := f.Read(data)
 
 		if err != nil {
-			switch err {
-			case io.EOF:
-				fmt.Println("file closed")
-				break loop
-			default:
-				log.Fatal("error", err)
-				return
-			}
+			break
 		}
 		data = data[:n]
 		if i := bytes.IndexByte(data, '\n'); i != -1 {
