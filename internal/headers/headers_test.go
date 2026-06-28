@@ -181,9 +181,10 @@ func TestHeadersGetSetCaseInsensitive(t *testing.T) {
 	assert.Equal(t, "application/json", h.Get("CONTENT-TYPE"))
 	assert.Equal(t, "", h.Get("Missing-Header"))
 
-	// Set overwrites the existing entry regardless of the casing used.
+	// A second Set on the same key (any casing) folds rather than overwrites;
+	// the dedicated folding contract lives in TestHeadersSetMultiValue.
 	h.Set("CONTENT-TYPE", "text/html")
-	assert.Equal(t, "text/html", h.Get("Content-Type"))
+	assert.Equal(t, "application/json, text/html", h.Get("Content-Type"))
 
 	// The same case-insensitivity holds for parsed headers.
 	parsed := NewHeaders()
@@ -227,19 +228,79 @@ func TestHeadersIncrementalParsing(t *testing.T) {
 	assert.Equal(t, "*/*", h.Get("Accept"))
 }
 
-// TestHeadersDuplicateKeys pins the CURRENT behavior for repeated field names:
-// the last value wins because Set simply overwrites the map entry.
-//
-// NOTE: a fully RFC 7230 §3.2.2-compliant parser would instead combine repeated
-// values into a single comma-separated list ("lane, prime"). This test exists
-// to make that limitation explicit rather than accidental.
-func TestHeadersDuplicateKeys(t *testing.T) {
-	h := NewHeaders()
-	data := []byte("Set-Person: lane\r\nSet-Person: prime\r\n\r\n")
+// TestHeadersMultiValueParse verifies RFC 7230 §3.2.2 value folding: repeated
+// field names are combined into a single comma-separated value, in arrival
+// order, rather than overwriting one another. "Foo: a\r\nFoo: b" is defined by
+// the spec to be equivalent to "Foo: a, b".
+func TestHeadersMultiValueParse(t *testing.T) {
+	t.Run("two occurrences fold in order", func(t *testing.T) {
+		h := NewHeaders()
+		data := []byte("Set-Person: lane\r\nSet-Person: prime\r\n\r\n")
 
-	n, done, err := h.Parse(data)
-	require.NoError(t, err)
-	assert.True(t, done)
-	assert.Equal(t, len(data), n)
-	assert.Equal(t, "prime", h.Get("Set-Person"))
+		n, done, err := h.Parse(data)
+		require.NoError(t, err)
+		assert.True(t, done)
+		assert.Equal(t, len(data), n)
+		assert.Equal(t, "lane, prime", h.Get("Set-Person"))
+	})
+
+	t.Run("three occurrences fold in order", func(t *testing.T) {
+		h := NewHeaders()
+		data := []byte("Accept: text/html\r\nAccept: application/json\r\nAccept: */*\r\n\r\n")
+
+		_, _, err := h.Parse(data)
+		require.NoError(t, err)
+		assert.Equal(t, "text/html, application/json, */*", h.Get("Accept"))
+	})
+
+	t.Run("folding is case-insensitive on the field name", func(t *testing.T) {
+		h := NewHeaders()
+		// Different casings of the same field name must fold together, since
+		// keys are normalized to lower case before lookup.
+		data := []byte("X-Tag: a\r\nx-tag: b\r\nX-TAG: c\r\n\r\n")
+
+		_, _, err := h.Parse(data)
+		require.NoError(t, err)
+		assert.Equal(t, "a, b, c", h.Get("X-Tag"))
+	})
+
+	t.Run("distinct field names are not folded together", func(t *testing.T) {
+		h := NewHeaders()
+		data := []byte("Host: a\r\nAccept: b\r\nHost: c\r\n\r\n")
+
+		_, _, err := h.Parse(data)
+		require.NoError(t, err)
+		assert.Equal(t, "a, c", h.Get("Host"))
+		assert.Equal(t, "b", h.Get("Accept"))
+	})
+
+	t.Run("a repeated header with an empty value still inserts a separator", func(t *testing.T) {
+		h := NewHeaders()
+		// Folding concatenates unconditionally, so an empty second value
+		// yields a trailing ", " — current behavior, pinned intentionally.
+		data := []byte("X-Empty: a\r\nX-Empty:\r\n\r\n")
+
+		_, _, err := h.Parse(data)
+		require.NoError(t, err)
+		assert.Equal(t, "a, ", h.Get("X-Empty"))
+	})
+}
+
+// TestHeadersSetMultiValue exercises Set directly (not via Parse) to document
+// its folding contract as a unit:
+//   - the first Set stores the value verbatim;
+//   - each subsequent Set appends ", value";
+//   - the key is matched case-insensitively across calls.
+func TestHeadersSetMultiValue(t *testing.T) {
+	h := NewHeaders()
+
+	h.Set("Cache-Control", "max-age=3600")
+	assert.Equal(t, "max-age=3600", h.Get("Cache-Control"), "first Set stores verbatim")
+
+	h.Set("Cache-Control", "must-revalidate")
+	assert.Equal(t, "max-age=3600, must-revalidate", h.Get("Cache-Control"))
+
+	// Different casing targets the same stored entry and keeps folding.
+	h.Set("cache-control", "no-store")
+	assert.Equal(t, "max-age=3600, must-revalidate, no-store", h.Get("Cache-Control"))
 }
