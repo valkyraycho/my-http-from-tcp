@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valkyraycho/my-http-from-tcp/internal/headers"
 )
 
 type chunkReader struct {
@@ -189,8 +190,9 @@ func TestRequestFromReaderIncompleteRequestLine(t *testing.T) {
 // state machine itself, exercising transitions the public API can't reach:
 //   - incomplete input returns (0, nil) and leaves state untouched, so the
 //     caller knows to read more;
-//   - a completed parse consumes exactly the request-line bytes and then
-//     treats further input as a no-op;
+//   - parsing the request line advances to StateHeaders (not StateDone) and
+//     consumes exactly the request-line bytes when no header lines follow yet;
+//   - the empty terminator line drives StateHeaders -> StateDone;
 //   - once a parse errors, the request is poisoned and rejects further input.
 func TestParseStateMachine(t *testing.T) {
 	t.Run("incomplete input asks for more without erroring", func(t *testing.T) {
@@ -203,16 +205,26 @@ func TestParseStateMachine(t *testing.T) {
 		assert.Equal(t, RequestLine{}, req.RequestLine)
 	})
 
-	t.Run("complete line consumes only the request line", func(t *testing.T) {
+	t.Run("request line advances to header state", func(t *testing.T) {
 		req := newRequest()
-		// 16 bytes: "GET / HTTP/1.1" (14) + CRLF (2). The trailing "extra"
-		// belongs to headers/body and must NOT be consumed here.
+		// 16 bytes: "GET / HTTP/1.1" (14) + CRLF (2). "extra" has no CRLF, so
+		// it's an incomplete header line: parse leaves it for the next call.
 		n, err := req.parse([]byte("GET / HTTP/1.1\r\nextra"))
 
 		require.NoError(t, err)
 		assert.Equal(t, 16, n)
-		assert.Equal(t, StateDone, req.state)
+		assert.Equal(t, StateHeaders, req.state) // not done: headers still pending
 		assert.Equal(t, "GET", req.RequestLine.Method)
+	})
+
+	t.Run("terminator line transitions headers to done", func(t *testing.T) {
+		req := newRequest()
+		// Request line, then immediately the empty line that ends the headers.
+		n, err := req.parse([]byte("GET / HTTP/1.1\r\n\r\n"))
+
+		require.NoError(t, err)
+		assert.Equal(t, 18, n)
+		assert.Equal(t, StateDone, req.state)
 
 		// Once done, further parse calls are a no-op (already complete).
 		n2, err := req.parse([]byte("anything"))
@@ -229,5 +241,112 @@ func TestParseStateMachine(t *testing.T) {
 		// A poisoned request must not silently accept a valid line afterward.
 		_, err = req.parse([]byte("GET / HTTP/1.1\r\n"))
 		require.ErrorIs(t, err, ErrRequestInErrorState)
+	})
+}
+
+// TestRequestHeadersParse covers the integration between the request parser and
+// the header sub-parser: RequestFromReader must drive Headers.Parse to
+// completion, expose the parsed headers on Request.Headers, and (because both
+// stages share one buffered loop) work regardless of how the stream is chunked.
+func TestRequestHeadersParse(t *testing.T) {
+	t.Run("standard headers", func(t *testing.T) {
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n",
+			numBytesPerRead: 3,
+		}
+		r, err := RequestFromReader(reader)
+		require.NoError(t, err)
+		require.NotNil(t, r)
+		require.NotNil(t, r.Headers)
+
+		assert.Equal(t, "localhost:42069", r.Headers.Get("Host"))
+		assert.Equal(t, "curl/7.81.0", r.Headers.Get("User-Agent"))
+		assert.Equal(t, "*/*", r.Headers.Get("Accept"))
+	})
+
+	t.Run("header lookup is case-insensitive", func(t *testing.T) {
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+			numBytesPerRead: 5,
+		}
+		r, err := RequestFromReader(reader)
+		require.NoError(t, err)
+		assert.Equal(t, "example.com", r.Headers.Get("host"))
+		assert.Equal(t, "example.com", r.Headers.Get("HOST"))
+	})
+
+	t.Run("repeated headers fold into one comma-separated value", func(t *testing.T) {
+		// Verifies the request parser inherits Headers' RFC 7230 value folding.
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\nAccept: text/html\r\nAccept: application/json\r\n\r\n",
+			numBytesPerRead: 7,
+		}
+		r, err := RequestFromReader(reader)
+		require.NoError(t, err)
+		assert.Equal(t, "text/html, application/json", r.Headers.Get("Accept"))
+	})
+
+	t.Run("request with no headers", func(t *testing.T) {
+		// Request line immediately followed by the empty terminator line.
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\n\r\n",
+			numBytesPerRead: 4,
+		}
+		r, err := RequestFromReader(reader)
+		require.NoError(t, err)
+		require.NotNil(t, r.Headers)
+		assert.Equal(t, "", r.Headers.Get("Host"), "no headers means empty lookups")
+		assert.Equal(t, "GET", r.RequestLine.Method, "request line still parsed")
+	})
+
+	t.Run("headers parse identically across chunk sizes", func(t *testing.T) {
+		const input = "GET /coffee HTTP/1.1\r\nHost: localhost:42069\r\nUser-Agent: curl/7.81.0\r\nAccept: */*\r\n\r\n"
+
+		for _, chunk := range []int{1, 2, 3, 7, 16, len(input)} {
+			t.Run(fmt.Sprintf("chunk=%d", chunk), func(t *testing.T) {
+				reader := &chunkReader{data: input, numBytesPerRead: chunk}
+				r, err := RequestFromReader(reader)
+				require.NoError(t, err)
+				assert.Equal(t, "localhost:42069", r.Headers.Get("Host"))
+				assert.Equal(t, "curl/7.81.0", r.Headers.Get("User-Agent"))
+				assert.Equal(t, "*/*", r.Headers.Get("Accept"))
+			})
+		}
+	})
+
+	t.Run("malformed header name propagates as an error", func(t *testing.T) {
+		// "H@st" contains '@', not a valid tchar, so Headers.Parse rejects it.
+		// That error must bubble up and fail the whole request.
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\nH@st: localhost\r\n\r\n",
+			numBytesPerRead: 3,
+		}
+		r, err := RequestFromReader(reader)
+		require.Error(t, err)
+		require.ErrorIs(t, err, headers.ErrMalformedFieldName)
+		assert.Nil(t, r)
+	})
+
+	t.Run("header line missing colon propagates as an error", func(t *testing.T) {
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\nNoColonHeader\r\n\r\n",
+			numBytesPerRead: 3,
+		}
+		r, err := RequestFromReader(reader)
+		require.Error(t, err)
+		require.ErrorIs(t, err, headers.ErrMalformedFieldLine)
+		assert.Nil(t, r)
+	})
+
+	t.Run("headers present but terminator missing is incomplete", func(t *testing.T) {
+		// The stream ends after a valid header line but before the blank line
+		// that ends the header block, so the request is truncated.
+		reader := &chunkReader{
+			data:            "GET / HTTP/1.1\r\nHost: localhost\r\n",
+			numBytesPerRead: 3,
+		}
+		r, err := RequestFromReader(reader)
+		require.ErrorIs(t, err, ErrIncompleteRequest)
+		assert.Nil(t, r)
 	})
 }
