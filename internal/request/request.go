@@ -33,6 +33,7 @@ type RequestLine struct {
 var ErrMalformedRequestLine = errors.New("malformed request line")
 var ErrUnsupportedHttpVersion = errors.New("unsupported HTTP version")
 var ErrRequestInErrorState = errors.New("request in error state")
+var ErrIncompleteRequest = errors.New("incomplete request: stream ended before request was fully parsed")
 
 var SEPARATOR = []byte("\r\n")
 
@@ -61,6 +62,12 @@ func RequestFromReader(r io.Reader) (*Request, error) {
 
 		copy(buf, buf[readN:bufLen])
 		bufLen -= readN
+	}
+
+	// The loop can also exit because the stream hit EOF mid-parse. If the
+	// parser never reached a terminal state, the request was truncated.
+	if !req.isDone() {
+		return nil, ErrIncompleteRequest
 	}
 
 	return req, nil
