@@ -21,6 +21,12 @@ func NewHeaders() *Headers {
 	}
 }
 
+func (h *Headers) ForEach(f func(key, value string)) {
+	for k, v := range h.headers {
+		f(k, v)
+	}
+}
+
 func (h *Headers) Get(key string) string {
 	return h.headers[strings.ToLower(key)]
 }
